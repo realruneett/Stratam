@@ -1,0 +1,544 @@
+ROLE: You are a competition-winning ML engineer and Kaggle Grandmaster
+specializing in spatio-temporal demand forecasting. You write
+production-grade, self-contained Python code that runs the first time
+without errors, handles edge cases silently, and never requires manual
+intervention between cells.
+
+═══════════════════════════════════════════════════════════════════
+MISSION
+═══════════════════════════════════════════════════════════════════
+Build a complete, winning ML pipeline for the HackerEarth Flipkart
+Gridlock Hackathon 2.0 — "Traffic Demand Prediction" challenge.
+
+Deliverables:
+  1. A single Jupyter Notebook (.ipynb) that runs top-to-bottom
+     with Run All → submission.csv produced, zero manual steps
+  2. submission.csv in the exact HackerEarth format
+  3. A feature_importance.csv for post-submission diagnosis
+
+Hardware target:
+  WSL2, Intel Core Ultra 9 275HX, 32GB RAM,
+  NVIDIA RTX 5070 Ti (12GB VRAM), CUDA 12.x, Python 3.10+
+
+═══════════════════════════════════════════════════════════════════
+CELL 0 — INSTALL & GPU VERIFICATION
+═══════════════════════════════════════════════════════════════════
+Bash cell (first cell):
+  !pip install lightgbm xgboost catboost scikit-learn shap \
+               pandas numpy matplotlib seaborn --quiet
+
+Python cell (second cell):
+  import torch, lightgbm as lgb, xgboost as xgb, catboost
+  print("CUDA available  :", torch.cuda.is_available())
+  print("GPU name        :", torch.cuda.get_device_name(0)
+        if torch.cuda.is_available() else "NONE — abort")
+  print("LightGBM version:", lgb.__version__)
+  print("XGBoost version :", xgb.__version__)
+  assert torch.cuda.is_available(), "GPU not found. Check CUDA drivers."
+
+LightGBM GPU device string — determine at runtime:
+  import lightgbm as lgb
+  lgb_version = tuple(int(x) for x in lgb.__version__.split(".")[:2])
+  LGB_DEVICE = "cuda" if lgb_version >= (4, 0) else "gpu"
+  # lgb >= 4.0 uses device='cuda'; older uses device='gpu' (OpenCL)
+  # If 'cuda' fails at fit time, catch the exception and retry
+  # with device='gpu' as fallback
+
+═══════════════════════════════════════════════════════════════════
+CELL 1 — SEEDS & GLOBAL CONFIG
+═══════════════════════════════════════════════════════════════════
+SEED = 42
+Set seed on: random, numpy, os.environ["PYTHONHASHSEED"],
+  torch.manual_seed, torch.cuda.manual_seed_all,
+  (lightgbm seed passed per-call, not globally)
+
+MAX_LAGS = 168          # 1 week back — dictates train tail size
+ROLLING_WINDOWS = [3, 6, 12, 24, 168]
+HOLDOUT_FRAC = 0.15     # chronological holdout fraction
+N_CV_FOLDS = 5          # for OOF generation
+N_ESTIMATORS = 5000     # max trees; early stopping will cut earlier
+EARLY_STOPPING = 100
+
+═══════════════════════════════════════════════════════════════════
+CELL 2 — ADAPTIVE SCHEMA DETECTION
+═══════════════════════════════════════════════════════════════════
+Write `detect_schema(df)` → returns a dict:
+  {
+    "timestamp_col": str,
+    "location_cols": List[str],
+    "target_col": str,
+    "categorical_cols": List[str],
+    "id_col": str or None
+  }
+
+Detection logic (in priority order):
+
+TIMESTAMP: Check columns for dtype datetime64 first. If none,
+  try pd.to_datetime() on each object/string column — if it
+  succeeds without error, mark as timestamp. If still none,
+  check column names for substrings: [time, date, hour, period,
+  timestamp, ts]. Raise ValueError if zero candidates found.
+  Use utc=False, infer_datetime_format=True. If parsing produces
+  timezone-aware timestamps, call .dt.tz_localize(None) to strip
+  tz and avoid downstream DST issues.
+
+ID: Any column named exactly [id, row_id, trip_id, record_id,
+  index] or a monotonically increasing integer column not used
+  elsewhere. May be None if test has no explicit ID (use RangeIndex).
+
+TARGET: The single numeric column that is NOT timestamp, NOT id,
+  NOT a column whose name contains [lat, lon, grid, zone, junction,
+  sector, area, region, location, id]. If ambiguity remains,
+  pick the column with the highest variance. Raise ValueError if
+  zero or more than one candidate remains after all filters.
+
+LOCATION: Columns with dtype int or str AND cardinality between
+  2 and 10000 AND column name contains any of [grid, zone,
+  junction, sector, area, region, location, cluster, node].
+  If no name match, fall back to: integer columns with cardinality
+  < 1000 that are not the ID column. Lat/lon are excluded: any
+  column with name containing [lat, lon] or with float dtype and
+  all values in range [-180, 180] is NEVER a location column.
+
+CATEGORICAL: String/object columns with cardinality < 300 that
+  are not timestamp and not target.
+
+Print the full schema report:
+  timestamp_col, location_cols, target_col, categorical_cols,
+  id_col, plus: unique location count, date range, target stats.
+
+═══════════════════════════════════════════════════════════════════
+CELL 3 — DATA LOADING
+═══════════════════════════════════════════════════════════════════
+Load train.csv and test.csv from ./data/
+Run detect_schema() on train_df.
+Parse timestamp column with pd.to_datetime(), strip timezone.
+
+Sort train_df by [timestamp_col, location_cols[0]] ascending.
+Sort test_df by [timestamp_col, location_cols[0]] ascending.
+
+Diagnostic prints:
+  train shape, test shape, date range of each,
+  target: mean, std, min, max, skew, kurtosis, null count,
+  null count per column.
+
+Check for temporal overlap:
+  If test timestamps overlap with train timestamps, print WARNING.
+  If test is entirely future (no overlap), print CONFIRMED FUTURE.
+  This affects lag strategy below.
+
+═══════════════════════════════════════════════════════════════════
+CELL 4 — TARGET TRANSFORM
+═══════════════════════════════════════════════════════════════════
+Inspect target distribution:
+  skew = train_df[target_col].skew()
+
+If abs(skew) > 1.0:
+  Apply log1p transform.
+  CRITICAL: Before log1p, clip target to 0:
+    train_df[target_col] = np.log1p(
+        train_df[target_col].clip(lower=0)
+    )
+  Set USE_LOG_TRANSFORM = True
+  Print "Log1p transform applied. New skew: {new_skew:.3f}"
+Else:
+  Set USE_LOG_TRANSFORM = False
+  Print "No transform needed. Skew: {skew:.3f}"
+
+Store the transform flag globally. All inverse operations at the
+end must check USE_LOG_TRANSFORM before applying np.expm1().
+
+═══════════════════════════════════════════════════════════════════
+CELL 5 — SPATIAL STATISTICS (train-only, stored globally)
+═══════════════════════════════════════════════════════════════════
+Compute on TRAIN ONLY. Store as module-level variable
+`SPATIAL_STATS` so it can be merged into test without recomputing.
+
+For each location column, group train_df and compute:
+  {loc_col}_mean_demand
+  {loc_col}_median_demand
+  {loc_col}_std_demand
+  {loc_col}_max_demand
+  {loc_col}_min_demand
+  {loc_col}_demand_rank   (rank 1 = highest demand, dense)
+  {loc_col}_peak_hour     (hour of day with max avg demand)
+
+SPATIAL_STATS = dict keyed by location column name.
+
+Fill strategy for unseen locations in test:
+  Any location in test not present in train → fill ALL spatial
+  stat columns with global train median. Do NOT drop or error.
+
+═══════════════════════════════════════════════════════════════════
+CELL 6 — FEATURE ENGINEERING
+═══════════════════════════════════════════════════════════════════
+CRITICAL ARCHITECTURE: Lag and rolling features require historical
+context. You CANNOT compute them on test independently.
+
+Step 6a — Build a combined computation frame:
+  For each location in test_df, extract the last MAX_LAGS (168)
+  rows from train_df for that location. This is the "history tail".
+  Concatenate: compute_df = pd.concat([history_tail, test_df])
+  Sort by [timestamp_col, location_col].
+  Set a flag column: compute_df["_is_test"] = 0 for train rows,
+    1 for test rows. This is how you slice back later.
+
+Step 6b — Define `build_features(df, spatial_stats)`:
+  This function receives a DataFrame and the SPATIAL_STATS dict.
+  It must be callable on BOTH train_df and compute_df.
+
+  A. TEMPORAL
+     year, month, day, hour, minute (if available), day_of_week,
+     day_of_year, week_of_year, quarter,
+     is_weekend = (day_of_week >= 5).astype(int),
+     is_peak_hour = hour.isin([7,8,9,17,18,19,20]).astype(int),
+     is_night = hour.isin([23,0,1,2,3,4]).astype(int)
+
+  B. CYCLICAL ENCODINGS
+     hour_sin = sin(2π × hour / 24)
+     hour_cos = cos(2π × hour / 24)
+     dow_sin  = sin(2π × day_of_week / 7)
+     dow_cos  = cos(2π × day_of_week / 7)
+     month_sin = sin(2π × month / 12)
+     month_cos = cos(2π × month / 12)
+     doy_sin  = sin(2π × day_of_year / 365)
+     doy_cos  = cos(2π × day_of_year / 365)
+
+  C. SPATIAL STATS MERGE
+     For each location_col, merge SPATIAL_STATS[loc_col] on
+     location_col using left join. Fill missing with global median.
+
+  D. LAG FEATURES (grouped by each location_col)
+     SORT by [location_col, timestamp_col] before computing.
+     Lags: t-1, t-2, t-3, t-6, t-12, t-24, t-48, t-168
+     Use .groupby(loc_col)[target_col].shift(n) for each lag n.
+     Do NOT use transform or any operation that looks forward.
+
+  E. ROLLING FEATURES (grouped by each location_col)
+     SHIFT by 1 BEFORE rolling to prevent leakage:
+       shifted = df.groupby(loc_col)[target_col].shift(1)
+     Then compute rolling on the shifted series (per group):
+       For windows [3, 6, 12, 24, 168]:
+         rolling_mean_{w}, rolling_std_{w},
+         rolling_max_{w}, rolling_min_{w}
+     Also: ewm_mean_24 = shifted per group, ewm span=24
+
+  F. INTERACTION FEATURES
+     demand_vs_loc_mean = lag_1 / (loc_mean_demand + 1e-5)
+     hour_x_loc_rank = hour × loc_demand_rank
+     If lat/lon columns detected: haversine distance to
+       Bengaluru center (12.9716, 77.5946) in km:
+         R = 6371
+         dlat = radians(lat - 12.9716)
+         dlon = radians(lon - 77.5946)
+         a = sin(dlat/2)^2 + cos(lat)*cos(12.9716)*sin(dlon/2)^2
+         dist_to_center = 2*R*arcsin(sqrt(a))
+
+  G. NULL HANDLING (run in this exact order):
+     1. For each lag/rolling column: fill NaN with the
+        per-location median of that column in train.
+     2. Any remaining NaN: fill with global median of that column.
+     3. Replace inf and -inf with column 99th/1st percentile.
+     4. ASSERT: assert df.isnull().sum().sum() == 0,
+        f"Null leak: {df.isnull().sum()[df.isnull().sum()>0]}"
+
+Step 6c — Apply build_features:
+  train_feats = build_features(train_df, SPATIAL_STATS)
+  compute_feats = build_features(compute_df, SPATIAL_STATS)
+
+  Extract test features:
+    test_feats = compute_feats[compute_feats["_is_test"] == 1]
+    test_feats = test_feats.drop(columns=["_is_test"])
+
+  For unseen test locations (not in train):
+    Print WARNING with count. These rows will have NaN lags.
+    Apply global median fill (already handled by step G above).
+
+Step 6d — Memory optimization:
+  Write `reduce_memory(df)`:
+    For each numeric column:
+      If int: downcast to smallest fitting int type
+      If float: downcast to float32
+        EXCEPTION: do NOT downcast target column — keep float64
+        EXCEPTION: do NOT downcast columns whose max > 1e15
+          (can cause inf after float32 cast)
+    Print: memory before → after in MB
+  Apply reduce_memory() to train_feats and test_feats.
+
+Build FEATURE_COLS:
+  All columns in train_feats EXCEPT:
+    timestamp_col, target_col, "_is_test", id_col (if present),
+    any column with "demand" in the name that is not a feature
+    (i.e. the raw target — not lag/rolling derived features).
+
+═══════════════════════════════════════════════════════════════════
+CELL 7 — VALIDATION SPLIT & CUSTOM TIME-BASED CV
+═══════════════════════════════════════════════════════════════════
+Strategy: Split on UNIQUE TIMESTAMPS, not on row index.
+  This is critical for multi-location datasets where the same
+  timestamp appears once per location — a row-index split would
+  put some locations in train and others in validation for the
+  same time period, which is a form of data leakage.
+
+Unique timestamps from train_feats sorted ascending.
+  n_unique = len(unique_timestamps)
+  cutoff_idx = int(n_unique * (1 - HOLDOUT_FRAC))
+  train_times = unique_timestamps[:cutoff_idx]
+  val_times   = unique_timestamps[cutoff_idx:]
+
+  tr_mask  = train_feats[timestamp_col].isin(train_times)
+  val_mask = train_feats[timestamp_col].isin(val_times)
+
+  X_tr,  y_tr  = train_feats.loc[tr_mask,  FEATURE_COLS], train_feats.loc[tr_mask,  target_col]
+  X_val, y_val = train_feats.loc[val_mask, FEATURE_COLS], train_feats.loc[val_mask, target_col]
+
+Print: tr size, val size, val date range.
+
+For OOF generation (meta-learner training), implement a custom
+time-based K-fold splitter as a generator function
+`time_kfold_split(df, timestamp_col, n_splits)`:
+  unique_ts = sorted(df[timestamp_col].unique())
+  fold_size = len(unique_ts) // n_splits
+  For fold i in range(n_splits):
+    val_ts = unique_ts[i*fold_size : (i+1)*fold_size]
+    train_ts = unique_ts[:i*fold_size]  # strictly past
+    If len(train_ts) == 0: skip fold (first fold has no history)
+    Yield: (train_mask_indices, val_mask_indices)
+  This ensures: no same-timestamp rows split across folds,
+  strictly chronological, no leakage.
+
+═══════════════════════════════════════════════════════════════════
+CELL 8 — MODEL TRAINING (OOF + FINAL)
+═══════════════════════════════════════════════════════════════════
+For each of the 3 models below, do TWO training passes:
+  PASS A: OOF generation using time_kfold_split
+    → produces oof_{model} array (full training data length)
+    → records best_iteration per fold → mean_best_iter
+  PASS B: Final model on 100% training data
+    → n_estimators = min(int(mean_best_iter * 1.1), 10000)
+    → no early stopping (iterations are fixed from Pass A)
+    → produces test predictions: pred_{model}
+
+─── MODEL 1: LightGBM ───
+  OOF pass (PASS A):
+    params = {
+      "device": LGB_DEVICE,       # runtime-detected above
+      "objective": "regression_l1",
+      "metric": ["rmse", "mae"],
+      "n_estimators": N_ESTIMATORS,
+      "learning_rate": 0.02,
+      "num_leaves": 255,
+      "min_child_samples": 20,
+      "feature_fraction": 0.8,
+      "bagging_fraction": 0.8,
+      "bagging_freq": 1,
+      "reg_alpha": 0.1,
+      "reg_lambda": 0.1,
+      "verbose": -1,
+      "seed": SEED
+    }
+    Wrap fit() in try/except LightGBMError:
+      If device='cuda' fails, retry with device='gpu'.
+      If 'gpu' also fails, retry with device='cpu' and warn.
+    Use callbacks=[lgb.early_stopping(EARLY_STOPPING),
+                   lgb.log_evaluation(500)]
+    eval_set = [(X_fold_val, y_fold_val)]
+
+  Final pass (PASS B): same params but n_estimators = fixed,
+    no early_stopping callback, fit on full X_tr+X_val, y_tr+y_val.
+
+─── MODEL 2: XGBoost ───
+  OOF pass (PASS A):
+    params = {
+      "tree_method": "hist",
+      "device": "cuda",
+      "objective": "reg:absoluteerror",
+      "eval_metric": ["rmse", "mae"],
+      "n_estimators": N_ESTIMATORS,
+      "learning_rate": 0.02,
+      "max_depth": 8,
+      "min_child_weight": 5,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "reg_alpha": 0.05,
+      "reg_lambda": 0.1,
+      "seed": SEED
+    }
+    Use xgb.XGBRegressor with early_stopping_rounds=EARLY_STOPPING,
+    eval_set=[(X_fold_val, y_fold_val)], verbose=500.
+    Fallback: if CUDA fails, set device="cpu" and warn.
+
+─── MODEL 3: CatBoost ───
+  OOF pass (PASS A):
+    DETECTED_CAT_COLS = [c for c in FEATURE_COLS
+                         if c in detected_categorical_cols]
+    # Only pass cat_features that are actually in FEATURE_COLS
+    params = {
+      "task_type": "GPU",
+      "devices": "0",
+      "loss_function": "MAE",
+      "eval_metric": "RMSE",
+      "iterations": N_ESTIMATORS,
+      "learning_rate": 0.02,
+      "depth": 8,
+      "l2_leaf_reg": 3,
+      "random_seed": SEED,
+      "verbose": 500
+    }
+    fit(X_fold_tr, y_fold_tr,
+        cat_features=DETECTED_CAT_COLS,
+        eval_set=(X_fold_val, y_fold_val),
+        early_stopping_rounds=EARLY_STOPPING,
+        use_best_model=True)
+    Fallback: if GPU fails, set task_type="CPU" and warn.
+
+After all OOF passes, print per-fold and mean RMSE for each model.
+
+═══════════════════════════════════════════════════════════════════
+CELL 9 — STACKING META-LEARNER
+═══════════════════════════════════════════════════════════════════
+Assemble OOF matrix (shape: n_train_rows × 3):
+  X_meta = np.column_stack([oof_lgb, oof_xgb, oof_cat])
+  y_meta = train_feats[target_col].values
+
+Train Ridge regressor:
+  from sklearn.linear_model import Ridge
+  ridge = Ridge(alpha=1.0, fit_intercept=True)
+  ridge.fit(X_meta, y_meta)
+
+Sanity check: if ANY Ridge coefficient is negative, it means a
+  model is hurting the ensemble. In that case:
+    Print WARNING: "Negative Ridge weight detected — using
+      clipped non-negative weights instead."
+    weights = np.maximum(ridge.coef_, 0)
+    weights = weights / weights.sum()
+    # Fall back to explicit weighted average
+    USE_WEIGHTED_AVG = True
+  Else:
+    USE_WEIGHTED_AVG = False
+
+Assemble test predictions:
+  X_test_meta = np.column_stack([pred_lgb, pred_xgb, pred_cat])
+
+Final predictions:
+  if USE_WEIGHTED_AVG:
+    final_preds = (weights[0]*pred_lgb
+                 + weights[1]*pred_xgb
+                 + weights[2]*pred_cat)
+  else:
+    final_preds = ridge.predict(X_test_meta)
+
+Print:
+  Ridge coefficients / weights per model
+  OOF validation RMSE and MAE of the blended ensemble
+  OOF validation RMSE and MAE of each base model individually
+
+═══════════════════════════════════════════════════════════════════
+CELL 10 — POST-PROCESSING
+═══════════════════════════════════════════════════════════════════
+Step 1 — Inverse transform (if USE_LOG_TRANSFORM):
+  final_preds = np.expm1(final_preds)
+  # DO THIS BEFORE any clipping or rounding
+
+Step 2 — Non-negativity:
+  final_preds = np.maximum(final_preds, 0)
+
+Step 3 — Integer rounding (conditional):
+  orig_target = pd.read_csv("./data/train.csv")[target_col]
+  if (orig_target.dropna() == orig_target.dropna().round()).all():
+    final_preds = np.round(final_preds).astype(int)
+    print("Integer target detected — rounding predictions.")
+
+Step 4 — Sanity checks:
+  assert not np.any(np.isnan(final_preds)), "NaN in final_preds"
+  assert not np.any(np.isinf(final_preds)), "Inf in final_preds"
+  assert np.all(final_preds >= 0), "Negative predictions remain"
+
+Step 5 — Distribution comparison:
+  Print side-by-side:
+    train target: min, max, mean, std
+    predictions:  min, max, mean, std
+  If abs(pred_mean - train_mean) / train_mean > 0.3:
+    Print WARNING: "Prediction mean deviates >30% from train mean.
+      Check target transform or data leakage."
+
+═══════════════════════════════════════════════════════════════════
+CELL 11 — FEATURE IMPORTANCE & DIAGNOSTICS
+═══════════════════════════════════════════════════════════════════
+LightGBM gain-based importance → top 30 feature bar chart.
+Save full importance table to ./feature_importance.csv.
+
+If shap is installed (wrapped in try/except ImportError):
+  Compute SHAP values on 500 random validation samples from LGB.
+  Plot SHAP summary plot.
+  Do NOT raise error if SHAP fails — just print "SHAP skipped."
+
+Print training time per model (use time.perf_counter()).
+Print peak GPU VRAM: torch.cuda.max_memory_reserved(0) / 1e9 GB.
+
+MAPE diagnostic (on validation set, before inverse transform):
+  mape_epsilon = 1e-5   # guard against division by zero
+  mape = np.mean(np.abs(y_val - oof_blend_val)
+                 / np.maximum(np.abs(y_val), mape_epsilon)) * 100
+  Print f"Validation MAPE: {mape:.2f}%"
+
+═══════════════════════════════════════════════════════════════════
+CELL 12 — SUBMISSION OUTPUT
+═══════════════════════════════════════════════════════════════════
+Load original (unmodified) test.csv again into raw_test.
+
+Duplicate row check:
+  if id_col is not None:
+    dups = raw_test[id_col].duplicated().sum()
+    if dups > 0:
+      Print WARNING: f"{dups} duplicate IDs in test.csv"
+      raw_test = raw_test.drop_duplicates(subset=[id_col])
+      Print "Duplicates removed."
+  assert len(raw_test) == len(final_preds), (
+    f"Row count mismatch: test={len(raw_test)}, "
+    f"preds={len(final_preds)}"
+  )
+
+Build submission DataFrame:
+  sub_target_col = detected_target_col  # exact name from train.csv
+  if id_col is not None:
+    submission = pd.DataFrame({
+        id_col: raw_test[id_col].values,
+        sub_target_col: final_preds
+    })
+  else:
+    submission = pd.DataFrame({sub_target_col: final_preds})
+
+Save:
+  submission.to_csv("./submission.csv", index=False)
+
+Verify:
+  print("Shape            :", submission.shape)
+  print("Dtypes:\n",          submission.dtypes)
+  print("Null counts:\n",     submission.isnull().sum())
+  print("Head:\n",            submission.head(10))
+  print("Describe:\n",        submission.describe())
+  assert submission.shape[0] == len(raw_test), "Row count mismatch"
+  assert submission.isnull().sum().sum() == 0, "Nulls in submission"
+  print("✓ submission.csv ready")
+
+═══════════════════════════════════════════════════════════════════
+CODE QUALITY NON-NEGOTIABLES
+═══════════════════════════════════════════════════════════════════
+- Every function has a docstring: Args, Returns, Raises
+- Every cell has a markdown header cell above it
+- assert statements at: after schema detection, after null fill,
+  after OOF shape verification, after submission row count check
+- No hardcoded column names anywhere in the code — all column
+  references must go through the schema detection variables
+- Cell boundaries formatted as:
+  # ── CELL [N]: Title ──────────────────────────────────────────
+- No cell should require >10 minutes on the target hardware
+- The complete notebook must Run All without errors or prompts
+
+═══════════════════════════════════════════════════════════════════
+DO NOT TRUNCATE ANY SECTION. WRITE EVERY LINE OF CODE.
+No placeholder comments like "# add feature engineering here".
+If a function body exceeds 80 lines, keep it — completeness over
+brevity. This prompt is a spec, not a suggestion.
+═══════════════════════════════════════════════════════════════════
