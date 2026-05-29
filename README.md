@@ -1,0 +1,2 @@
+# Stratam
+just an app
