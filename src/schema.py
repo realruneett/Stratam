@@ -98,18 +98,18 @@ def _detect_timestamp(df: pd.DataFrame) -> list:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             candidates.append(col)
     if candidates:
-        return candidates
+        return _sort_ts_candidates(candidates)
 
     # Priority 2: parseable object/string
     for col in df.select_dtypes(include=["object", "string"]).columns:
         try:
-            parsed = pd.to_datetime(df[col], infer_datetime_format=True, utc=False)
+            parsed = pd.to_datetime(df[col], utc=False)
             if parsed.notna().sum() > len(df) * 0.5:
                 candidates.append(col)
         except (ValueError, TypeError, OverflowError):
             continue
     if candidates:
-        return candidates
+        return _sort_ts_candidates(candidates)
 
     # Priority 3: name heuristic
     keywords = ["time", "date", "hour", "period", "timestamp", "ts"]
@@ -117,7 +117,31 @@ def _detect_timestamp(df: pd.DataFrame) -> list:
         if any(kw in col.lower() for kw in keywords):
             candidates.append(col)
 
-    return candidates
+    return _sort_ts_candidates(candidates)
+
+
+def _sort_ts_candidates(candidates: list) -> list:
+    """Sort timestamp candidates so 'timestamp' comes first.
+
+    Prevents a 'day' column from being selected over a 'timestamp'
+    column when both parse as datetime.
+
+    Args:
+        candidates: List of column names.
+
+    Returns:
+        Sorted list with 'timestamp'-named columns first.
+    """
+    def _prio(name: str) -> int:
+        low = name.lower().strip()
+        if low == "timestamp":
+            return 0
+        if "timestamp" in low:
+            return 1
+        if low == "datetime":
+            return 2
+        return 3
+    return sorted(candidates, key=_prio)
 
 
 def _detect_id(df: pd.DataFrame, used: set) -> str | None:
@@ -167,6 +191,7 @@ def _detect_latlon(df: pd.DataFrame) -> set:
 _LOC_KEYWORDS = [
     "grid", "zone", "junction", "sector", "area",
     "region", "location", "cluster", "node",
+    "geohash", "geo",
 ]
 
 
@@ -224,6 +249,10 @@ def _detect_target(df: pd.DataFrame, used: set, latlon: set) -> str:
     Raises:
         ValueError: If no target column can be determined.
     """
+    for col in df.columns:
+        if col.lower() == "demand" and col not in used:
+            return col
+
     candidates = []
     for col in df.columns:
         if col in used or col in latlon:

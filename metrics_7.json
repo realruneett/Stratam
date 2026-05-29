@@ -1,0 +1,21 @@
+{
+    "transform_selected": "identity",
+    "baseline_holdout_r2": 0.46313963031152283,
+    "model_holdout_r2": {
+        "LightGBM": 0.9534525068035837,
+        "XGBoost": 0.9560829994099546,
+        "CatBoost": 0.950681569319063
+    },
+    "ensemble_holdout_r2": 0.9560045872072793,
+    "local_score": 95.60045872072793,
+    "recorded_online_score": 83.13,
+    "cv_lb_gap": 12.470458720727933,
+    "leaderboard_top": 93.13,
+    "real_task_validation_status": "FAILED_NO_MATCHING_SLOTS",
+    "ensemble_oof_r2": 0.9388234575500607,
+    "ensemble_oof_rmse": 0.03516902405904583,
+    "ensemble_oof_mae": 0.02311099936721552,
+    "stack_method": "weighted_avg",
+    "baseline_floor_applied": false,
+    "run_id": 7
+}

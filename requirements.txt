@@ -8,3 +8,5 @@ numpy
 matplotlib
 seaborn
 torch
+pytest
+hypothesis

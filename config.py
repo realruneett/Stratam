@@ -15,6 +15,10 @@ SEED = 42
 def seed_everything(seed: int = SEED) -> None:
     """Lock down all random number generators for reproducibility.
 
+    This is the single seeding entry point for the pipeline (Req 6.4):
+    every stochastic step must be initialized via this function from the
+    one configured non-negative ``SEED``.
+
     Args:
         seed: Integer seed value.
 
@@ -33,14 +37,32 @@ def seed_everything(seed: int = SEED) -> None:
         pass
 
 
-# ─── Hyperparameters ────────────────────────────────────────────
+# ─── Test-data time-of-day window ───────────────────────────────
+# Quarter-hour slots covering the test daytime window 2:15–13:45 inclusive.
+# tod_slot = (hour * 60 + minute) // 15, so 2:15 -> 9 and 13:45 -> 55.
 
-MAX_LAGS: int = 168                     # 1 week back
-ROLLING_WINDOWS: list = [3, 6, 12, 24, 168]
-HOLDOUT_FRAC: float = 0.15             # chronological holdout
-N_CV_FOLDS: int = 5                    # OOF folds
+TEST_TOD_SLOT_MIN: int = 9             # floor((2*60 + 15) / 15)
+TEST_TOD_SLOT_MAX: int = 55            # floor((13*60 + 45) / 15)
+
+
+# ─── Leak-free target encoding ──────────────────────────────────
+
+TE_SMOOTHING_ALPHA: float = 20.0       # Bayesian prior weight:
+#                                        (sum + prior_mean*alpha) / (count + alpha)
+TE_N_FOLDS: int = 5                    # out-of-fold folds for in-training encoding
+
+
+# ─── Modeling / generalization-first regime ─────────────────────
+
+N_CV_FOLDS: int = 5                    # OOF folds (superseded by TE_N_FOLDS)
 N_ESTIMATORS: int = 5000               # max trees; early stopping cuts earlier
 EARLY_STOPPING: int = 100
+
+
+# ─── Honest performance reporting ───────────────────────────────
+
+RECORDED_ONLINE_SCORE: float = 83.13   # current measured leaderboard score
+LEADERBOARD_TOP: float = 93.13         # leaderboard top score (success target)
 
 
 # ─── Paths ──────────────────────────────────────────────────────

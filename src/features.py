@@ -1,6 +1,32 @@
 """
-Feature engineering: temporal, cyclical, spatial merge, lags,
-rolling / EWM, interactions, null handling, and memory reduction.
+Leak-free feature builder for the demand-prediction-overhaul.
+
+This module was gutted of every history-based / target-shifted feature group
+(the root cause of the train/test leakage). The old ``build_compute_df``
+history-tail mechanism and the lag / rolling / EWM / lag-derived interaction
+features are gone, as is the synthetic-calendar temporal/cyclical block.
+
+What remains is a single, leak-free ``build_features`` that assembles model
+inputs from signal that genuinely exists at prediction time:
+
+  * **Time-of-day cyclical** encodings derived from the real clock
+    (``tod_slot``, ``hour``, ``minute`` provided by ``data.load_data``):
+    ``tod_sin``/``tod_cos`` (period 96), ``minute_of_day_sin``/``cos``
+    (period 1440), ``is_peak_hour``, ``is_night``, and ``day``.
+  * **Leak-free geohash encodings** merged from a fitted
+    :class:`src.spatial.TargetEncoder` (or already-present out-of-fold columns),
+    with the train-derived Unseen_Geohash fallback.
+  * The **day-48 time-of-day demand curve** (``tod_curve_mean``) joined on
+    ``tod_slot`` via :func:`src.spatial.transform_tod_curve`.
+  * The **contextual columns** ``RoadType``, ``NumberofLanes``,
+    ``LargeVehicles``, ``Landmarks``, ``Temperature``, ``Weather`` as row
+    features with consistent integer category codes shared across train/test.
+
+All target-derived artifacts (geohash encodings, the time-of-day curve, the
+imputation values) are fit on a fitting partition *outside* this module and
+passed in, so ``build_features`` never reads the input frame's own target. It
+therefore succeeds and produces the same feature columns whether ``demand`` is
+present, absent, or all-NaN (Requirement 1.6 / design Property 1).
 """
 
 from __future__ import annotations
@@ -8,200 +34,236 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.spatial import (
+    ENCODING_COLS,
+    InteractionEncoder,
+    TargetEncoder,
+    interaction_feature_cols,
+    transform_tod_curve,
+)
 
-# ─── Computation Frame ──────────────────────────────────────────
+# ─── Feature configuration ─────────────────────────────────────
+
+#: The six contextual columns kept as ordinary row features (Requirement 3.4).
+CONTEXTUAL_COLS = [
+    "RoadType",
+    "NumberofLanes",
+    "LargeVehicles",
+    "Landmarks",
+    "Temperature",
+    "Weather",
+]
+
+#: Contextual columns that are imputed with the dedicated ``"Missing"`` category
+#: when null (Requirement 3.6). These are the nullable *string* categoricals.
+MISSING_CATEGORY_COLS = ["RoadType", "Weather"]
+
+#: Default sentinel category used for missing nullable categorical values.
+MISSING_CATEGORY = "Missing"
+
+#: Hours treated as peak / night for the boolean time-of-day flags.
+_PEAK_HOURS = (7, 8, 9, 17, 18, 19, 20)
+_NIGHT_HOURS = (23, 0, 1, 2, 3, 4)
+
+#: Quarter-hour slots per day (period of the ``tod_slot`` cycle).
+_SLOTS_PER_DAY = 96
+#: Minutes per day (period of the ``minute_of_day`` cycle).
+_MINUTES_PER_DAY = 1440
 
 
-def build_compute_df(
+# ─── Imputer fitting ───────────────────────────────────────────
+
+
+def build_imputers(
     train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    timestamp_col: str,
-    location_cols: list[str],
-    target_col: str,
-    max_lags: int,
-) -> pd.DataFrame:
-    """
-    Concatenate a history tail from train onto test so that
-    lag / rolling features can be computed for test rows.
+    categorical_cols: list[str] | None = None,
+    target_col: str | None = None,
+) -> dict:
+    """Compute train-only imputation values for ``build_features`` (Req 3.6).
+
+    Imputation values are derived from the **fitting partition only** (the
+    holdout's training complement in the validation context, or the full
+    ``train.csv`` in the final context). They are then applied inside
+    :func:`build_features` to the null cells of any frame.
+
+    Imputation policy:
+      * ``Temperature`` → the train-only **median** (a finite float; falls back
+        to ``0.0`` when the partition has no non-null Temperature values).
+      * ``RoadType`` / ``Weather`` → a dedicated ``"Missing"`` category so that
+        missingness itself becomes a signal.
+      * ``NumberofLanes`` is complete in the data and is **not** imputed.
 
     Args:
-        train_df: Training data.
-        test_df: Test data.
-        timestamp_col: Timestamp column name.
-        location_cols: Location column names.
-        target_col: Target column name.
-        max_lags: Number of historical rows per location.
+        train_df: The fitting-partition frame to derive imputation values from.
+        categorical_cols: Accepted for API symmetry with the Task 12 wiring;
+            the set of categorical columns imputed with ``"Missing"`` is fixed
+            by :data:`MISSING_CATEGORY_COLS`.
+        target_col: Accepted for API symmetry; unused (imputers are not
+            target-derived).
 
     Returns:
-        Combined DataFrame with ``_is_test`` flag column.
+        A dict of imputation values::
+
+            {
+                "Temperature_median": float,   # train-only median
+                "missing_category": "Missing", # for RoadType / Weather
+            }
     """
-    if not location_cols:
-        history = train_df.tail(max_lags).copy()
-        history["_is_test"] = 0
-        test_part = test_df.copy()
-        test_part["_is_test"] = 1
-        if target_col not in test_part.columns:
-            test_part[target_col] = np.nan
-        out = pd.concat([history, test_part], ignore_index=True)
-        return out.sort_values(timestamp_col).reset_index(drop=True)
+    temperature_median = 0.0
+    if "Temperature" in train_df.columns:
+        median = pd.to_numeric(train_df["Temperature"], errors="coerce").median()
+        if pd.notna(median):
+            temperature_median = float(median)
 
-    loc_col = location_cols[0]
-    parts = []
-    for loc in test_df[loc_col].unique():
-        tail = train_df[train_df[loc_col] == loc].tail(max_lags).copy()
-        parts.append(tail)
-
-    history = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=train_df.columns)
-    history["_is_test"] = 0
-
-    test_part = test_df.copy()
-    test_part["_is_test"] = 1
-    if target_col not in test_part.columns:
-        test_part[target_col] = np.nan
-
-    out = pd.concat([history, test_part], ignore_index=True)
-    return out.sort_values([timestamp_col, loc_col]).reset_index(drop=True)
+    return {
+        "Temperature_median": temperature_median,
+        "missing_category": MISSING_CATEGORY,
+    }
 
 
-# ─── Main Feature Builder ──────────────────────────────────────
+# ─── Main feature builder ──────────────────────────────────────
 
 
 def build_features(
     df: pd.DataFrame,
-    spatial_stats: dict[str, pd.DataFrame],
-    timestamp_col: str,
-    location_cols: list[str],
-    target_col: str,
-    global_train_median: float,
-    rolling_windows: list[int],
+    encoder: TargetEncoder | None,
+    tod_curve: pd.Series,
     categorical_cols: list[str],
+    location_cols: list[str],
+    impute_values: dict,
+    category_maps: dict[str, list] | None = None,
+    slot_col: str = "tod_slot",
+    oof_encoded: bool | None = None,
+    interaction_encoder: "InteractionEncoder | None" = None,
 ) -> pd.DataFrame:
-    """
-    Build all features. Works on both the full training set
-    and the compute frame (history-tail + test).
+    """Assemble the reduced, leak-free model-input feature set.
 
-    Feature groups:
-        A. Temporal   B. Cyclical   C. Spatial merge
-        D. Lags       E. Rolling / EWM
-        F. Interactions   G. Null handling
+    The function is leak-free by construction: it never reads ``df``'s target
+    column. All target-derived signal enters through the pre-fitted ``encoder``
+    (or already-present out-of-fold encoding columns) and ``tod_curve``, and all
+    imputation values come from ``impute_values`` (fit on a separate partition).
+    As a result the produced feature columns are identical whether the target
+    column is present, absent, or all-NaN (Requirement 1.6 / design Property 1).
+
+    Feature groups produced:
+      * Time-of-day cyclical (Req 3.2): ``tod_sin``/``tod_cos`` (period 96),
+        ``minute_of_day_sin``/``minute_of_day_cos`` (period 1440),
+        ``is_peak_hour``, ``is_night``, and ``day`` (already present).
+      * Geohash encodings (Req 3.1, 3.7): ``geohash_mean``/``geohash_median``/
+        ``geohash_std``/``geohash_rank`` merged with the Unseen_Geohash fallback.
+      * Day-48 time-of-day curve (Req 3.3): ``tod_curve_mean`` joined on
+        ``tod_slot``.
+      * Contextual columns (Req 3.4) with consistent integer category codes
+        (Req 3.5) and train-derived, null-only imputation (Req 3.6).
+
+    Geohash-encoding source (two contexts):
+      * **Training frame (out-of-fold):** the caller passes a frame that already
+        carries the OOF encoding columns from
+        :meth:`src.spatial.TargetEncoder.fit_oof`. Those columns are detected and
+        reused as-is so a row's encoding never uses its own target.
+      * **Eval / test frame:** the caller passes a fitted ``encoder`` and no
+        encoding columns; ``encoder.transform(df)`` merges them (with the
+        train-derived unseen-geohash fallback).
+
+    The behavior can be forced via ``oof_encoded``; when left as ``None`` it is
+    auto-detected by the presence of all :data:`src.spatial.ENCODING_COLS`.
+
+    Row order and index are preserved (no sorting), so the output aligns 1:1
+    with the input frame and with any OOF encodings computed alongside it.
 
     Args:
-        df: Input DataFrame.
-        spatial_stats: Pre-computed spatial statistics dict.
-        timestamp_col: Timestamp column name.
-        location_cols: Location column names.
-        target_col: Target column name.
-        global_train_median: Global target median from train.
-        rolling_windows: Window sizes for rolling features.
-        categorical_cols: Categorical column names.
+        df: Input frame (post-``load_data``: has ``hour``, ``minute``,
+            ``tod_slot``, ``day``, ``geohash`` and the contextual columns).
+        encoder: A fitted :class:`src.spatial.TargetEncoder`. May be ``None``
+            only when the encoding columns are already present (OOF path).
+        tod_curve: The day-48 time-of-day curve Series from
+            :func:`src.spatial.fit_tod_curve`.
+        categorical_cols: Names of the string categorical columns to integer
+            encode (e.g. ``RoadType``, ``LargeVehicles``, ``Landmarks``,
+            ``Weather``). The raw ``geohash`` location column is intentionally
+            NOT in this list — its signal enters via the encodings only.
+        location_cols: Location column names (e.g. ``["geohash"]``); used to
+            locate the geohash column for encoding and to keep the raw string
+            column out of the numeric feature set.
+        impute_values: Dict from :func:`build_imputers`.
+        category_maps: Optional ``col -> ordered categories`` mapping built over
+            the union of train+test categories so codes are consistent across
+            frames (Req 3.5). When provided for a nullable categorical column,
+            ``"Missing"`` is appended if absent so it maps to a stable code.
+        slot_col: Name of the quarter-hour slot column. Defaults to ``"tod_slot"``.
+        oof_encoded: Force the OOF path (``True``) or the ``encoder.transform``
+            path (``False``). ``None`` (default) auto-detects.
 
     Returns:
-        Feature-enriched DataFrame (copy of input).
+        A copy of ``df`` enriched with the leak-free feature columns. The target
+        column (if present) is passed through untouched for downstream training;
+        :func:`select_feature_cols` excludes it from the model inputs.
+
+    Raises:
+        RuntimeError: If geohash encodings are neither present nor obtainable
+            (``oof_encoded`` is False / unset and ``encoder`` is ``None``).
     """
     df = df.copy()
-    ts = df[timestamp_col]
 
-    # ── A. Temporal ──────────────────────────────────────────────
-    df["year"]         = ts.dt.year
-    df["month"]        = ts.dt.month
-    df["day"]          = ts.dt.day
-    df["hour"]         = ts.dt.hour
-    df["minute"]       = ts.dt.minute
-    df["day_of_week"]  = ts.dt.dayofweek
-    df["day_of_year"]  = ts.dt.dayofyear
-    df["week_of_year"] = ts.dt.isocalendar().week.astype(int)
-    df["quarter"]      = ts.dt.quarter
-    df["is_weekend"]   = (df["day_of_week"] >= 5).astype(int)
-    df["is_peak_hour"] = df["hour"].isin([7, 8, 9, 17, 18, 19, 20]).astype(int)
-    df["is_night"]     = df["hour"].isin([23, 0, 1, 2, 3, 4]).astype(int)
+    # ── Time-of-day cyclical features (Req 3.2) ──────────────────
+    slot = df[slot_col].astype(float)
+    df["tod_sin"] = np.sin(2 * np.pi * slot / _SLOTS_PER_DAY)
+    df["tod_cos"] = np.cos(2 * np.pi * slot / _SLOTS_PER_DAY)
 
-    # ── B. Cyclical ──────────────────────────────────────────────
-    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"] / 24)
-    df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"] / 7)
-    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
-    df["doy_sin"]   = np.sin(2 * np.pi * df["day_of_year"] / 365)
-    df["doy_cos"]   = np.cos(2 * np.pi * df["day_of_year"] / 365)
+    minute_of_day = (df["hour"].astype(float) * 60 + df["minute"].astype(float))
+    df["minute_of_day_sin"] = np.sin(2 * np.pi * minute_of_day / _MINUTES_PER_DAY)
+    df["minute_of_day_cos"] = np.cos(2 * np.pi * minute_of_day / _MINUTES_PER_DAY)
 
-    # ── C. Spatial stats merge ───────────────────────────────────
-    for loc_col in location_cols:
-        if loc_col not in spatial_stats:
-            continue
-        stats_df = spatial_stats[loc_col]
-        df = df.merge(stats_df, left_on=loc_col, right_index=True, how="left")
-        for sc in stats_df.columns:
-            df[sc] = df[sc].fillna(global_train_median)
+    df["is_peak_hour"] = df["hour"].isin(_PEAK_HOURS).astype(int)
+    df["is_night"] = df["hour"].isin(_NIGHT_HOURS).astype(int)
+    # ``day`` is already a column from load_data and is retained as a feature.
 
-    # ── D. Lag features ──────────────────────────────────────────
-    lag_values = [1, 2, 3, 6, 12, 24, 48, 168]
-    if location_cols:
-        loc_col = location_cols[0]
-        df = df.sort_values([loc_col, timestamp_col]).reset_index(drop=True)
-        for n in lag_values:
-            df[f"lag_{n}"] = df.groupby(loc_col)[target_col].shift(n)
+    # ── Geohash encodings merge (Req 3.1, 3.7) ───────────────────
+    have_encodings = all(col in df.columns for col in ENCODING_COLS)
+    use_oof = have_encodings if oof_encoded is None else oof_encoded
+
+    if use_oof:
+        if not have_encodings:
+            raise RuntimeError(
+                "build_features: oof_encoded=True but the out-of-fold encoding "
+                f"columns {ENCODING_COLS} are not present on the frame."
+            )
+        # Encodings already present (OOF) — reuse as-is (leak-free by construction).
     else:
-        df = df.sort_values(timestamp_col).reset_index(drop=True)
-        for n in lag_values:
-            df[f"lag_{n}"] = df[target_col].shift(n)
+        if encoder is None:
+            raise RuntimeError(
+                "build_features: no encoder provided and the encoding columns "
+                f"{ENCODING_COLS} are absent. Pass a fitted TargetEncoder or a "
+                "frame already carrying OOF encodings."
+            )
+        df = encoder.transform(df)
 
-    # ── E. Rolling / EWM features ────────────────────────────────
-    if location_cols:
-        loc_col = location_cols[0]
-        shifted = df.groupby(loc_col)[target_col].shift(1)
-    else:
-        shifted = df[target_col].shift(1)
+    # ── Day-48 time-of-day curve merge (Req 3.3) ─────────────────
+    df = transform_tod_curve(df, tod_curve, slot_col=slot_col)
 
-    for w in rolling_windows:
-        if location_cols:
-            loc_col = location_cols[0]
-            roll = shifted.groupby(df[loc_col]).rolling(window=w, min_periods=1)
-            df[f"rolling_mean_{w}"] = roll.mean().reset_index(level=0, drop=True)
-            df[f"rolling_std_{w}"]  = roll.std().reset_index(level=0, drop=True)
-            df[f"rolling_max_{w}"]  = roll.max().reset_index(level=0, drop=True)
-            df[f"rolling_min_{w}"]  = roll.min().reset_index(level=0, drop=True)
-        else:
-            roll = shifted.rolling(window=w, min_periods=1)
-            df[f"rolling_mean_{w}"] = roll.mean()
-            df[f"rolling_std_{w}"]  = roll.std()
-            df[f"rolling_max_{w}"]  = roll.max()
-            df[f"rolling_min_{w}"]  = roll.min()
+    # ── Leak-free geohash×context interaction means (validated lever) ──
+    # Captures that demand depends on the INTERACTION of location with
+    # time-of-day / road type / weather, not just each separately. For the
+    # training frame the caller supplies the OOF columns already on `df`
+    # (auto-detected); for eval/test a fitted ``interaction_encoder`` merges
+    # them with the geohash/prior fallback chain. No-op when neither is given,
+    # so older callers/tests remain valid.
+    _inter_cols = interaction_feature_cols(
+        interaction_encoder.other_keys if interaction_encoder is not None else None
+    )
+    have_inter = all(c in df.columns for c in _inter_cols) and len(_inter_cols) > 0
+    if have_inter:
+        pass  # OOF interaction columns already present — reuse as-is (leak-free).
+    elif interaction_encoder is not None:
+        df = interaction_encoder.transform(df)
 
-    # EWM span 24
-    if location_cols:
-        loc_col = location_cols[0]
-        df["ewm_mean_24"] = (
-            shifted.groupby(df[loc_col])
-            .apply(lambda x: x.ewm(span=24, min_periods=1).mean())
-            .reset_index(level=0, drop=True)
-        )
-    else:
-        df["ewm_mean_24"] = shifted.ewm(span=24, min_periods=1).mean()
+    # ── Null handling, train-derived & null-only (Req 3.6) ───────
+    # Done BEFORE categorical encoding so "Missing" becomes its own code.
+    _apply_imputation(df, impute_values)
 
-    # ── F. Interaction features ──────────────────────────────────
-    if location_cols:
-        loc_col = location_cols[0]
-        mean_c = f"{loc_col}_mean_demand"
-        rank_c = f"{loc_col}_demand_rank"
-        if mean_c in df.columns:
-            df["demand_vs_loc_mean"] = df["lag_1"] / (df[mean_c] + 1e-5)
-        if rank_c in df.columns:
-            df["hour_x_loc_rank"] = df["hour"] * df[rank_c]
-
-    # Haversine to Bengaluru centre
-    _add_haversine(df)
-
-    # Encode categoricals as integer codes
-    for cat_col in categorical_cols:
-        if cat_col in df.columns:
-            df[cat_col] = df[cat_col].astype("category").cat.codes
-    for loc_col in location_cols:
-        if df[loc_col].dtype == "object" or df[loc_col].dtype.name == "category":
-            df[loc_col] = df[loc_col].astype("category").cat.codes
-
-    # ── G. Null handling ─────────────────────────────────────────
-    _handle_nulls(df, lag_values, rolling_windows, location_cols)
+    # ── Consistent categorical integer codes (Req 3.5) ───────────
+    missing_cat = impute_values.get("missing_category", MISSING_CATEGORY)
+    _encode_categoricals(df, categorical_cols, category_maps, missing_cat)
 
     return df
 
@@ -209,104 +271,77 @@ def build_features(
 # ─── Helpers ────────────────────────────────────────────────────
 
 
-def _add_haversine(df: pd.DataFrame) -> None:
-    """Add haversine distance to Bengaluru centre if lat/lon exist.
+def _apply_imputation(df: pd.DataFrame, impute_values: dict) -> None:
+    """Impute only the null cells of the nullable contextual columns in-place.
+
+    ``Temperature`` nulls → the train-derived median; ``RoadType`` / ``Weather``
+    nulls → the ``"Missing"`` category. ``pandas.Series.fillna`` touches only
+    null cells, so non-null values are left unchanged (Requirement 3.6).
+    ``NumberofLanes`` is complete and is not imputed.
 
     Args:
-        df: DataFrame (modified in-place).
+        df: Frame to impute (modified in-place).
+        impute_values: Dict from :func:`build_imputers`.
 
     Returns:
         None
     """
-    lat_col = lon_col = None
-    for col in df.columns:
-        cl = col.lower()
-        if "lat" in cl and lat_col is None:
-            lat_col = col
-        if ("lon" in cl or "lng" in cl) and lon_col is None:
-            lon_col = col
+    temp_median = impute_values.get("Temperature_median")
+    if "Temperature" in df.columns and temp_median is not None:
+        df["Temperature"] = pd.to_numeric(
+            df["Temperature"], errors="coerce"
+        ).fillna(float(temp_median))
 
-    if lat_col is None or lon_col is None:
-        return
-
-    R = 6371.0
-    lat_r = np.radians(df[lat_col].astype(float))
-    lon_r = np.radians(df[lon_col].astype(float))
-    c_lat = np.radians(12.9716)
-    c_lon = np.radians(77.5946)
-    dlat = lat_r - c_lat
-    dlon = lon_r - c_lon
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat_r) * np.cos(c_lat) * np.sin(dlon / 2) ** 2
-    df["dist_to_center_km"] = 2 * R * np.arcsin(np.sqrt(a))
+    missing_cat = impute_values.get("missing_category", MISSING_CATEGORY)
+    for col in MISSING_CATEGORY_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna(missing_cat)
 
 
-def _handle_nulls(
+def _encode_categoricals(
     df: pd.DataFrame,
-    lag_values: list[int],
-    rolling_windows: list[int],
-    location_cols: list[str],
+    categorical_cols: list[str],
+    category_maps: dict[str, list] | None,
+    missing_cat: str,
 ) -> None:
-    """Fill NaNs and replace infinities in-place.
+    """Map string categorical columns to consistent integer codes in-place.
 
-    Steps (in order):
-        G1. Per-location median fill for lag/rolling columns.
-        G2. Global median fill for remaining numeric NaNs.
-        G3. Replace ±inf with 99th / 1st percentile.
-        G4. Final sweep: fill stragglers with 0.
-        G5. Assert zero nulls.
+    Codes come from ``category_maps`` (built over the union of train+test
+    categories) so a category present in both frames maps to the same integer
+    in both (Requirement 3.5). For nullable categorical columns the
+    ``"Missing"`` category is ensured in the category list so imputed cells get
+    a stable code. When no map is supplied for a column, codes are derived from
+    that column's own sorted categories (single-frame fallback).
 
     Args:
-        df: DataFrame (modified in-place).
-        lag_values: Lag step sizes.
-        rolling_windows: Rolling window sizes.
-        location_cols: Location columns.
+        df: Frame to encode (modified in-place).
+        categorical_cols: String categorical column names to encode.
+        category_maps: Optional ``col -> ordered categories`` mapping.
+        missing_cat: The sentinel category to ensure for nullable categoricals.
 
     Returns:
         None
-
-    Raises:
-        AssertionError: If any null remains.
     """
-    lr_cols = (
-        [f"lag_{n}" for n in lag_values]
-        + [f"rolling_mean_{w}" for w in rolling_windows]
-        + [f"rolling_std_{w}" for w in rolling_windows]
-        + [f"rolling_max_{w}" for w in rolling_windows]
-        + [f"rolling_min_{w}" for w in rolling_windows]
-        + ["ewm_mean_24"]
-    )
-    if "demand_vs_loc_mean" in df.columns:
-        lr_cols.append("demand_vs_loc_mean")
+    if category_maps is None:
+        category_maps = {}
 
-    # G1
-    if location_cols:
-        loc = location_cols[0]
-        for col in lr_cols:
-            if col in df.columns:
-                medians = df.groupby(loc)[col].transform("median")
-                df[col] = df[col].fillna(medians)
+    for col in categorical_cols:
+        if col not in df.columns:
+            continue
 
-    # G2
-    for col in df.select_dtypes(include=[np.number]).columns:
-        if df[col].isnull().any():
-            df[col] = df[col].fillna(df[col].median())
+        if col in category_maps:
+            cats = list(category_maps[col])
+        else:
+            cats = sorted(df[col].dropna().astype(str).unique().tolist())
 
-    # G3
-    for col in df.select_dtypes(include=[np.number]).columns:
-        if np.isinf(df[col]).any():
-            finite = df.loc[np.isfinite(df[col]), col]
-            df[col] = df[col].replace([np.inf], finite.quantile(0.99))
-            df[col] = df[col].replace([-np.inf], finite.quantile(0.01))
+        # Ensure the "Missing" sentinel has a stable code for nullable cats.
+        if col in MISSING_CATEGORY_COLS and missing_cat not in cats:
+            cats = cats + [missing_cat]
 
-    # G4
-    df.fillna(0, inplace=True)
-
-    # G5
-    null_counts = df.isnull().sum()
-    assert null_counts.sum() == 0, f"Null leak: {null_counts[null_counts > 0]}"
+        df[col] = pd.Categorical(df[col], categories=cats).codes
 
 
-# ─── Memory Optimization ───────────────────────────────────────
+# ─── Memory optimization ───────────────────────────────────────
 
 
 def reduce_memory(df: pd.DataFrame, target_col: str | None = None) -> pd.DataFrame:
@@ -344,7 +379,7 @@ def reduce_memory(df: pd.DataFrame, target_col: str | None = None) -> pd.DataFra
     return df
 
 
-# ─── Feature Column Selection ──────────────────────────────────
+# ─── Feature column selection ──────────────────────────────────
 
 
 def select_feature_cols(
@@ -353,12 +388,15 @@ def select_feature_cols(
     timestamp_col: str,
     target_col: str,
     id_col: str | None,
+    location_cols: list[str] | None = None,
 ) -> list[str]:
     """
     Determine which columns to use as model inputs.
 
-    Excludes timestamp, target, ``_is_test`` flag, ID, and any
-    non-numeric columns.
+    Excludes the timestamp, target, ``_is_test`` flag, ID, the ordering-only
+    ``abs_time`` index, the raw (string) location columns, and any remaining
+    non-numeric column. The raw ``geohash`` string is therefore never a feature
+    — its signal enters only through the leak-free encodings.
 
     Args:
         train_feats: Feature-engineered training DataFrame.
@@ -366,13 +404,16 @@ def select_feature_cols(
         timestamp_col: Timestamp column name.
         target_col: Target column name.
         id_col: ID column name (or None).
+        location_cols: Raw location column names to exclude (e.g. ``geohash``).
 
     Returns:
         Sorted list of feature column names present in both frames.
     """
-    exclude = {timestamp_col, target_col, "_is_test"}
+    exclude = {timestamp_col, target_col, "_is_test", "abs_time"}
     if id_col is not None:
         exclude.add(id_col)
+    if location_cols:
+        exclude.update(location_cols)
 
     cols = []
     for col in train_feats.columns:
