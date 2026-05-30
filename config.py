@@ -61,8 +61,8 @@ EARLY_STOPPING: int = 100
 
 # ─── Honest performance reporting ───────────────────────────────
 
-RECORDED_ONLINE_SCORE: float = 83.13   # current measured leaderboard score
-LEADERBOARD_TOP: float = 93.13         # leaderboard top score (success target)
+RECORDED_ONLINE_SCORE: float = 83.13   # latest measured leaderboard score
+LEADERBOARD_TOP: float = 93.13         # current leaderboard top (target)
 
 
 # ─── Paths ──────────────────────────────────────────────────────

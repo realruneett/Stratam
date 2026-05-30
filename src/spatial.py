@@ -715,3 +715,145 @@ def interaction_feature_cols(other_keys: list[str] | None = None) -> list[str]:
     """
     keys = other_keys if other_keys is not None else INTERACTION_KEYS
     return [_interaction_col(k) for k in keys]
+
+
+# ── Per-geohash day-48 time-of-day curve (sharp temporal signal) ─
+#
+# ``fit_tod_curve`` produces ONE global curve averaged across all geohashes,
+# which washes out that different locations peak at different times (an
+# industrial road at 7am vs a school road at 3pm). This per-geohash curve gives
+# each location its own day-48 time-of-day profile, smoothed toward that
+# geohash's overall mean (and the global prior) so sparse (geohash, slot) cells
+# degrade gracefully. Measured on the consistent-basis surrogate holdout it adds
+# ~+0.004 R² on top of the geohash×slot interaction. Fit day-48-only and never
+# reads day-49 targets, so it is leak-free for the day-49 daytime test window.
+
+PG_CURVE_COL = "pg_tod_curve_mean"
+
+
+class PerGeohashTodCurve:
+    """Leak-free per-geohash day-48 time-of-day demand curve.
+
+    For each ``(geohash, tod_slot)`` cell on day 48, the smoothed mean demand::
+
+        value = (cell_sum + geohash_mean * alpha) / (cell_count + alpha)
+
+    shrinks toward that geohash's day-48 mean; unseen cells fall back to the
+    geohash mean, and unseen geohashes to the global prior. Provides ``fit`` /
+    ``transform`` (for eval/test) and ``fit_oof`` (leak-free training column).
+
+    Attributes:
+        geohash_col: Location column name.
+        fit_day: Day used for fitting (48).
+        cell_: ``{(geohash, slot) -> smoothed_mean}`` table.
+        geohash_mean_: Per-geohash day-48 mean fallback.
+        global_prior_: Global fallback for unseen geohashes.
+        alpha_: Smoothing weight.
+    """
+
+    def __init__(self, geohash_col: str = "geohash", fit_day: int = TOD_CURVE_FIT_DAY) -> None:
+        """Create an unfitted per-geohash time-of-day curve.
+
+        Args:
+            geohash_col: Location column name.
+            fit_day: Day value whose rows are used for fitting (48).
+        """
+        self.geohash_col = geohash_col
+        self.fit_day = fit_day
+        self.cell_: pd.DataFrame | None = None
+        self.geohash_mean_: pd.Series | None = None
+        self.global_prior_: float = 0.0
+        self.alpha_: float = 25.0
+
+    def fit(self, df_fit: pd.DataFrame, target_col: str, alpha: float = 25.0,
+            day_col: str = "day", slot_col: str = "tod_slot") -> "PerGeohashTodCurve":
+        """Fit the smoothed per-geohash time-of-day curve on day-48 rows.
+
+        Args:
+            df_fit: Fitting partition.
+            target_col: Demand target column.
+            alpha: Smoothing weight toward the per-geohash mean.
+            day_col: Day column name.
+            slot_col: Time-of-day slot column name.
+
+        Returns:
+            ``self`` (fitted).
+        """
+        self.alpha_ = float(alpha)
+        geo = self.geohash_col
+        d48 = df_fit[df_fit[day_col] == self.fit_day] if day_col in df_fit.columns else df_fit
+        if len(d48) == 0:
+            d48 = df_fit
+        p = d48[target_col].mean()
+        self.global_prior_ = float(p) if pd.notna(p) else 0.0
+        self.geohash_mean_ = d48.groupby(geo)[target_col].mean()
+        cell = d48.groupby([geo, slot_col])[target_col].agg(["sum", "count"]).reset_index()
+        fb = cell[geo].map(self.geohash_mean_).fillna(self.global_prior_)
+        cell["_v"] = (cell["sum"] + fb * self.alpha_) / (cell["count"] + self.alpha_)
+        self.cell_ = cell[[geo, slot_col, "_v"]]
+        self._slot_col = slot_col
+        return self
+
+    def transform(self, df: pd.DataFrame, slot_col: str = "tod_slot",
+                  out_col: str = PG_CURVE_COL) -> pd.DataFrame:
+        """Merge the per-geohash curve onto ``df`` (leak-free).
+
+        Args:
+            df: Frame to annotate.
+            slot_col: Time-of-day slot column name.
+            out_col: Output column name.
+
+        Returns:
+            A copy of ``df`` with ``out_col`` added.
+        """
+        out = df.copy()
+        geo = self.geohash_col
+        merged = out[[geo, slot_col]].merge(self.cell_, on=[geo, slot_col], how="left")
+        fb = out[geo].map(self.geohash_mean_).fillna(self.global_prior_).to_numpy()
+        vals = merged["_v"].to_numpy()
+        out[out_col] = np.where(np.isnan(vals), fb, vals)
+        return out
+
+    def fit_oof(self, df_train: pd.DataFrame, target_col: str, alpha: float = 25.0,
+                n_folds: int | None = None, seed: int | None = None,
+                day_col: str = "day", slot_col: str = "tod_slot",
+                out_col: str = PG_CURVE_COL) -> pd.DataFrame:
+        """Produce out-of-fold per-geohash curve values for training rows.
+
+        Args:
+            df_train: Training frame.
+            target_col: Demand target column.
+            alpha: Smoothing weight.
+            n_folds: Fold count (defaults to ``TE_N_FOLDS``).
+            seed: KFold seed (defaults to ``SEED``).
+            day_col: Day column name.
+            slot_col: Slot column name.
+            out_col: Output column name.
+
+        Returns:
+            A copy of ``df_train`` with the OOF curve column added.
+        """
+        if n_folds is None:
+            n_folds = TE_N_FOLDS
+        if seed is None:
+            seed = SEED
+        out = df_train.copy()
+        n = len(df_train)
+        buf = np.full(n, np.nan)
+        if n == 0:
+            out[out_col] = pd.Series(dtype=float)
+            return out
+        pos = np.arange(n)
+        folds = ([(np.array([], dtype=int), pos)] if n < 2
+                 else list(KFold(min(n_folds, n), shuffle=True, random_state=seed).split(pos)))
+        for tri, evi in folds:
+            c = PerGeohashTodCurve(self.geohash_col, self.fit_day).fit(
+                df_train.iloc[tri], target_col, alpha, day_col, slot_col)
+            buf[evi] = c.transform(df_train.iloc[evi], slot_col, out_col)[out_col].to_numpy()
+        full = PerGeohashTodCurve(self.geohash_col, self.fit_day).fit(
+            df_train, target_col, alpha, day_col, slot_col)
+        fenc = full.transform(df_train, slot_col, out_col)[out_col].to_numpy()
+        mask = np.isnan(buf)
+        buf[mask] = fenc[mask]
+        out[out_col] = buf
+        return out

@@ -176,8 +176,7 @@ graph TD
     - **Validates: Requirements 3.6**
   - [x]* 5.8 Write unit test for contextual feature presence
     - Assert the six contextual columns appear in the feature set produced by `build_features`.
-    - 
-    : 3.4_
+    - _Requirements: 3.4_
 
 - [x] 6. Implement data-driven transform selection in `src/data.py`
   - [x] 6.1 Implement `select_transform` and `TransformSelectionError`

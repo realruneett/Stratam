@@ -37,6 +37,8 @@ import pandas as pd
 from src.spatial import (
     ENCODING_COLS,
     InteractionEncoder,
+    PerGeohashTodCurve,
+    PG_CURVE_COL,
     TargetEncoder,
     interaction_feature_cols,
     transform_tod_curve,
@@ -135,6 +137,7 @@ def build_features(
     slot_col: str = "tod_slot",
     oof_encoded: bool | None = None,
     interaction_encoder: "InteractionEncoder | None" = None,
+    pg_curve: "PerGeohashTodCurve | None" = None,
 ) -> pd.DataFrame:
     """Assemble the reduced, leak-free model-input feature set.
 
@@ -256,6 +259,15 @@ def build_features(
         pass  # OOF interaction columns already present — reuse as-is (leak-free).
     elif interaction_encoder is not None:
         df = interaction_encoder.transform(df)
+
+    # ── Per-geohash day-48 time-of-day curve (sharp temporal signal) ──
+    # Like the geohash encodings: if the OOF column is already present (training
+    # frame) reuse it; otherwise a fitted ``pg_curve`` merges it. No-op when
+    # neither is supplied, preserving older callers/tests.
+    if PG_CURVE_COL in df.columns:
+        pass  # OOF per-geohash curve already present — reuse as-is (leak-free).
+    elif pg_curve is not None:
+        df = pg_curve.transform(df, slot_col=slot_col)
 
     # ── Null handling, train-derived & null-only (Req 3.6) ───────
     # Done BEFORE categorical encoding so "Missing" becomes its own code.

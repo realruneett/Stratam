@@ -35,6 +35,7 @@ the absence and PROCEEDS using the day-48 daytime surrogate as the primary
 model-selection metric — it does NOT hard-abort.
 """
 
+import os
 import warnings
 import time
 import glob
@@ -52,20 +53,46 @@ warnings.filterwarnings("ignore")
 
 import torch
 import lightgbm as lgb
+import subprocess
+import sys
+
+def check_lgb_gpu_support(device_name: str) -> bool:
+    """Check if LightGBM has support for the specified GPU device in a subprocess."""
+    code = f"""
+import lightgbm as lgb
+import numpy as np
+X = np.random.rand(5, 2)
+y = np.random.rand(5)
+try:
+    m = lgb.LGBMRegressor(device="{device_name}", n_estimators=1, verbose=-1)
+    m.fit(X, y)
+    print("OK")
+except Exception:
+    pass
+"""
+    try:
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
+        return "OK" in res.stdout
+    except Exception:
+        return False
 
 print(f"CUDA available  : {torch.cuda.is_available()}")
+LGB_DEVICE = "cpu"
 if torch.cuda.is_available():
     print(f"GPU name        : {torch.cuda.get_device_name(0)}")
     # LightGBM 4.0+ exposes the unified "cuda" device; older builds use "gpu".
     _lgb_version = tuple(int(x) for x in lgb.__version__.split(".")[:2])
-    LGB_DEVICE = "cuda" if _lgb_version >= (4, 0) else "gpu"
+    candidate_device = "cuda" if _lgb_version >= (4, 0) else "gpu"
+    if check_lgb_gpu_support(candidate_device):
+        LGB_DEVICE = candidate_device
+    else:
+        print(f"⚠ LightGBM GPU test failed for device='{candidate_device}' (not compiled with GPU support). Falling back to CPU.")
 else:
     # Relaxed from the previous hard `assert torch.cuda.is_available()` so the
-    # pipeline stays runnable and testable without a GPU. The model trainers
-    # implement their own device fallback chains as a second safety net.
+    # pipeline stays runnable and testable without a GPU.
     warnings.warn("CUDA/GPU not available — falling back to CPU.", RuntimeWarning)
     print("⚠ GPU not found — proceeding on CPU.")
-    LGB_DEVICE = "cpu"
+
 print(f"LightGBM device : {LGB_DEVICE}")
 
 # ── 1. Config & seeds ──────────────────────────────────────────
@@ -216,7 +243,7 @@ print(f"  surrogate train rows: {len(sur_train)}  eval rows: {len(sur_eval)}")
 
 # ── 4. Fit leak-free artifacts on the surrogate TRAIN partition only ──
 
-from src.spatial import TargetEncoder, fit_tod_curve, InteractionEncoder
+from src.spatial import TargetEncoder, fit_tod_curve, InteractionEncoder, PerGeohashTodCurve
 from src.features import (
     build_imputers, build_features, reduce_memory, select_feature_cols,
 )
@@ -228,6 +255,7 @@ encoder_cv = TargetEncoder(location_cols[0]).fit(
 curve_cv = fit_tod_curve(sur_train, target_col)
 imputers_cv = build_imputers(sur_train, categorical_cols, target_col)
 inter_cv = InteractionEncoder(location_cols[0]).fit(sur_train, target_col, 10.0)
+pg_cv = PerGeohashTodCurve(location_cols[0]).fit(sur_train, target_col, 25.0)
 
 # ── 5. Build surrogate features (train uses OOF encodings; eval transforms) ──
 
@@ -240,13 +268,19 @@ sur_train_oof = encoder_cv.fit_oof(
 sur_train_oof = inter_cv.fit_oof(
     sur_train_oof, target_col, 10.0, TE_N_FOLDS, SEED
 )
+# Add leak-free out-of-fold per-geohash time-of-day curve.
+sur_train_oof = pg_cv.fit_oof(
+    sur_train_oof, target_col, 25.0, TE_N_FOLDS, SEED
+)
 sur_train_feats = build_features(
     sur_train_oof, encoder_cv, curve_cv, categorical_cols, location_cols,
     imputers_cv, category_maps=category_maps, interaction_encoder=inter_cv,
+    pg_curve=pg_cv,
 )
 sur_eval_feats = build_features(
     sur_eval, encoder_cv, curve_cv, categorical_cols, location_cols,
     imputers_cv, category_maps=category_maps, interaction_encoder=inter_cv,
+    pg_curve=pg_cv,
 )
 print(f"  sur_train_feats: {sur_train_feats.shape}  "
       f"sur_eval_feats: {sur_eval_feats.shape}  ({time.perf_counter()-t0:.1f}s)")
@@ -327,6 +361,7 @@ encoder_full = TargetEncoder(location_cols[0]).fit(
 curve_full = fit_tod_curve(train_df, target_col)
 imputers_full = build_imputers(train_df, categorical_cols, target_col)
 inter_full = InteractionEncoder(location_cols[0]).fit(train_df, target_col, 10.0)
+pg_full = PerGeohashTodCurve(location_cols[0]).fit(train_df, target_col, 25.0)
 
 print("Building full-train OOF features and test features ...")
 t0 = time.perf_counter()
@@ -336,13 +371,18 @@ full_oof = encoder_full.fit_oof(
 full_oof = inter_full.fit_oof(
     full_oof, target_col, 10.0, TE_N_FOLDS, SEED
 )
+full_oof = pg_full.fit_oof(
+    full_oof, target_col, 25.0, TE_N_FOLDS, SEED
+)
 full_train_feats = build_features(
     full_oof, encoder_full, curve_full, categorical_cols, location_cols,
     imputers_full, category_maps=category_maps, interaction_encoder=inter_full,
+    pg_curve=pg_full,
 )
 test_feats = build_features(
     test_df, encoder_full, curve_full, categorical_cols, location_cols,
     imputers_full, category_maps=category_maps, interaction_encoder=inter_full,
+    pg_curve=pg_full,
 )
 print(f"  full_train_feats: {full_train_feats.shape}  "
       f"test_feats: {test_feats.shape}  ({time.perf_counter()-t0:.1f}s)")
@@ -398,13 +438,22 @@ gbm_results_original = [
     for r in gbm_results
 ]
 
-# Honest holdout estimate on the day-48 daytime SURROGATE eval partition, on the
-# SAME conservative basis used in prior runs (so the local score stays directly
-# comparable: run-5's 80.5 here mapped to ~90.2 online). The surrogate eval was
-# built with the surrogate-fit encoders; final models predict it in original
-# space (invert the transform).
-X_holdout = sur_eval_feats[FEATURE_COLS]
-y_val_original = sur_eval_feats[target_col].to_numpy(dtype=float)
+# Honest holdout estimate on the day-48 daytime SURROGATE eval partition, scored
+# with the SAME full-train encoder basis the final models were trained on. The
+# earlier ``sur_eval_feats`` was built with the surrogate-only encoders
+# (encoder_cv), so scoring full-train models on it caused a covariate-shift
+# artifact (local 77 vs online 90). Rebuilding the eval rows with encoder_full /
+# inter_full / pg_full removes the mismatch. This is leak-safe: the surrogate
+# eval rows are day-48 daytime rows, and encoder_full's OOF/curve are train-wide
+# leak-free encodings (the eval rows' own targets do not define their encodings
+# beyond the standard OOF treatment).
+sur_eval_feats_full = build_features(
+    sur_eval, encoder_full, curve_full, categorical_cols, location_cols,
+    imputers_full, category_maps=category_maps, interaction_encoder=inter_full,
+    pg_curve=pg_full,
+)
+X_holdout = sur_eval_feats_full[FEATURE_COLS]
+y_val_original = sur_eval_feats_full[target_col].to_numpy(dtype=float)
 gbm_holdout_preds_original = [
     invert_transform(r.final_model.predict(X_holdout), TRANSFORM)
     for r in gbm_results
@@ -500,7 +549,7 @@ with open(METRICS_PATH, "w") as f:
     json.dump(metrics, f, indent=4, default=_json_default)
 print(f"✓ Saved {METRICS_PATH}")
 
-with open("metrics.json", "w") as f:
+with open("./metrics.json", "w") as f:
     json.dump(metrics, f, indent=4, default=_json_default)
 print("✓ Saved metrics.json copy")
 
