@@ -945,7 +945,7 @@ from sklearn.preprocessing import StandardScaler
 class _ContinuousMLP(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()
-        # GELU activation permits smooth continuous surfaces unlike tree steps
+        # GELU provides smooth continuous activation to trace exact functional surfaces
         self.net = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
@@ -959,7 +959,7 @@ class _ContinuousMLP(nn.Module):
         return self.net(x)
 
 class MLPWrapper:
-    """Scikit-learn style wrapper for the continuous surface model."""
+    """Scikit-learn style wrapper for the continuous surface neural network."""
     def __init__(self, input_dim: int, seed: int, device: str):
         torch.manual_seed(seed)
         self.device = torch.device(device)
@@ -1001,7 +1001,7 @@ class MLPWrapper:
                 patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter > 80: # Early stopping patience
+                if patience_counter > 80: # Early stopping patience window
                     break
                     
         if best_weights is not None:
@@ -1019,14 +1019,14 @@ class MLPWrapper:
 def train_continuous_mlp(
     train_feats, feature_cols, target_col,
     X_full, y_full, X_val, y_val, X_test,
-    n_folds=TE_N_FOLDS, seed=SEED, oof_split=None,
-    **kwargs,
+    n_folds=5, seed=42, oof_split=None, **kwargs
 ) -> ModelResult:
-    """Trains a continuous surface MLP matching the pipeline's data contract."""
+    """Trains a continuous surface MLP matching your pipeline's exact data contract."""
     X_full_df = _as_feature_df(X_full, feature_cols)
     X_val_df = _as_feature_df(X_val, feature_cols)
     X_test_df = _as_feature_df(X_test, feature_cols)
     y_arr = np.asarray(y_full, dtype=float)
+    y_val_arr = np.asarray(y_val, dtype=float)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("=" * 60)
@@ -1039,6 +1039,7 @@ def train_continuous_mlp(
         name="ContinuousMLP",
         oof=np.zeros(n, dtype=float),
         test_preds=np.zeros(len(X_test_df), dtype=float),
+        final_best_iter=0
     )
     
     folds = list(oof_split) if oof_split is not None else _kfold_positions(n, n_folds, seed)
@@ -1048,7 +1049,7 @@ def train_continuous_mlp(
         if va_pos.size == 0: continue
         
         wrapper = MLPWrapper(len(feature_cols), seed, device)
-        wrapper.fit(X_full_df.iloc[tr_pos], y_arr[tr_pos], X_val_df, y_val)
+        wrapper.fit(X_full_df.iloc[tr_pos], y_arr[tr_pos], X_val_df, y_val_arr)
         
         res.oof[va_pos] = wrapper.predict(X_full_df.iloc[va_pos])
         res.fold_rmses.append(rmse(y_arr[va_pos], res.oof[va_pos]))
@@ -1057,7 +1058,7 @@ def train_continuous_mlp(
     print(f"\n  MLP OOF mean RMSE: {np.mean(res.fold_rmses):.5f}")
     
     final_wrapper = MLPWrapper(len(feature_cols), seed, device)
-    final_wrapper.fit(X_full_df, y_arr, X_val_df, y_val)
+    final_wrapper.fit(X_full_df, y_arr, X_val_df, y_val_arr)
     res.final_model = final_wrapper
     res.test_preds = np.asarray(final_wrapper.predict(X_test_df), dtype=float)
     res.elapsed = time.perf_counter() - t0

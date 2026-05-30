@@ -292,7 +292,7 @@ FEATURE_COLS = select_feature_cols(
     sur_train_feats, sur_eval_feats, timestamp_col, target_col, id_col,
     location_cols=location_cols,
 )
-# Strip tree-overfitting continuous index proxies
+# Filter out high-cardinality noise shortcuts to force mathematical formula alignment
 FEATURE_COLS = [c for c in FEATURE_COLS if c != "Temperature"]
 
 # ── 6. Data-driven transform selection on the surrogate holdout (Req 4.2–4.4) ──
@@ -428,6 +428,7 @@ xgb_res = train_xgboost(**common)
 cat_res = train_catboost(**common, categorical_cols=categorical_cols)
 mlp_res = train_continuous_mlp(**common)
 
+# Append the continuous neural predictor to the stack array
 gbm_results = [lgb_res, xgb_res, cat_res, mlp_res]
 
 # Invert GBM OOF / test predictions to ORIGINAL space so the whole stack lives

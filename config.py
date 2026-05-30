@@ -13,18 +13,7 @@ SEED = 42
 
 
 def seed_everything(seed: int = SEED) -> None:
-    """Lock down all random number generators for reproducibility.
-
-    This is the single seeding entry point for the pipeline (Req 6.4):
-    every stochastic step must be initialized via this function from the
-    one configured non-negative ``SEED``.
-
-    Args:
-        seed: Integer seed value.
-
-    Returns:
-        None
-    """
+    """Lock down all random number generators for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -39,30 +28,35 @@ def seed_everything(seed: int = SEED) -> None:
 
 # ─── Test-data time-of-day window ───────────────────────────────
 # Quarter-hour slots covering the test daytime window 2:15–13:45 inclusive.
-# tod_slot = (hour * 60 + minute) // 15, so 2:15 -> 9 and 13:45 -> 55.
 
-TEST_TOD_SLOT_MIN: int = 9             # floor((2*60 + 15) / 15)
-TEST_TOD_SLOT_MAX: int = 55            # floor((13*60 + 45) / 15)
+TEST_TOD_SLOT_MIN: int = 9
+TEST_TOD_SLOT_MAX: int = 55
 
 
 # ─── Leak-free target encoding ──────────────────────────────────
 
-TE_SMOOTHING_ALPHA: float = 20.0       # Bayesian prior weight:
-#                                        (sum + prior_mean*alpha) / (count + alpha)
-TE_N_FOLDS: int = 5                    # out-of-fold folds for in-training encoding
+# FIX 3: Reduced from 20.0 → 5.0.
+# alpha=20 was pulling high-demand geohashes (mean=0.95, N=55) down to 0.72.
+# alpha=5 preserves the true per-geohash signal while still smoothing sparse ones.
+TE_SMOOTHING_ALPHA: float = 5.0
+
+# FIX (interaction encoder smoothing): Reduced from 10.0 → 5.0 for same reason.
+IE_SMOOTHING_ALPHA: float = 5.0
+
+TE_N_FOLDS: int = 5
 
 
 # ─── Modeling / generalization-first regime ─────────────────────
 
-N_CV_FOLDS: int = 5                    # OOF folds (superseded by TE_N_FOLDS)
-N_ESTIMATORS: int = 5000               # max trees; early stopping cuts earlier
+N_CV_FOLDS: int = 5
+N_ESTIMATORS: int = 5000
 EARLY_STOPPING: int = 100
 
 
 # ─── Honest performance reporting ───────────────────────────────
 
-RECORDED_ONLINE_SCORE: float = 83.13   # latest measured leaderboard score
-LEADERBOARD_TOP: float = 93.13         # current leaderboard top (target)
+RECORDED_ONLINE_SCORE: float = 90.69774
+LEADERBOARD_TOP: float = 100.0
 
 
 # ─── Paths ──────────────────────────────────────────────────────
