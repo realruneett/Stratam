@@ -292,6 +292,8 @@ FEATURE_COLS = select_feature_cols(
     sur_train_feats, sur_eval_feats, timestamp_col, target_col, id_col,
     location_cols=location_cols,
 )
+# Strip tree-overfitting continuous index proxies
+FEATURE_COLS = [c for c in FEATURE_COLS if c != "Temperature"]
 
 # ── 6. Data-driven transform selection on the surrogate holdout (Req 4.2–4.4) ──
 
@@ -399,7 +401,7 @@ for _c in FEATURE_COLS:
 # ── 8. Train GBMs (final on full train, early-stop on surrogate holdout) ──
 
 from src.models import (
-    train_lightgbm, train_xgboost, train_catboost, train_baseline,
+    train_lightgbm, train_xgboost, train_catboost, train_baseline, train_continuous_mlp
 )
 
 # Models train in the SELECTED transform space; OOF/test preds are inverted
@@ -424,8 +426,9 @@ common = dict(
 lgb_res = train_lightgbm(**common, lgb_device=LGB_DEVICE)
 xgb_res = train_xgboost(**common)
 cat_res = train_catboost(**common, categorical_cols=categorical_cols)
+mlp_res = train_continuous_mlp(**common)
 
-gbm_results = [lgb_res, xgb_res, cat_res]
+gbm_results = [lgb_res, xgb_res, cat_res, mlp_res]
 
 # Invert GBM OOF / test predictions to ORIGINAL space so the whole stack lives
 # in one coherent space (the baseline is original by construction).

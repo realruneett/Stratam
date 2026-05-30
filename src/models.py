@@ -932,3 +932,133 @@ def train_baseline(
         final_model=blend,
         final_best_iter=None,
     )
+
+
+# ===================================================================
+# CONTINUOUS MATHEMATICAL MAPPING ENGINE (For 100/100 Formula Fit)
+# ===================================================================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+
+class _ContinuousMLP(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        # GELU activation permits smooth continuous surfaces unlike tree steps
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, 1)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class MLPWrapper:
+    """Scikit-learn style wrapper for the continuous surface model."""
+    def __init__(self, input_dim: int, seed: int, device: str):
+        torch.manual_seed(seed)
+        self.device = torch.device(device)
+        self.model = _ContinuousMLP(input_dim).to(self.device)
+        self.scaler = StandardScaler()
+        
+    def fit(self, X_tr: pd.DataFrame, y_tr: np.ndarray, X_va: pd.DataFrame, y_va: np.ndarray, epochs: int = 1000):
+        X_tr_s = self.scaler.fit_transform(X_tr.fillna(0))
+        X_va_s = self.scaler.transform(X_va.fillna(0))
+        
+        t_X_tr = torch.FloatTensor(X_tr_s).to(self.device)
+        t_y_tr = torch.FloatTensor(y_tr).unsqueeze(1).to(self.device)
+        t_X_va = torch.FloatTensor(X_va_s).to(self.device)
+        t_y_va = torch.FloatTensor(y_va).unsqueeze(1).to(self.device)
+        
+        criterion = nn.MSELoss()
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-3, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=30)
+        
+        best_loss = float('inf')
+        best_weights = None
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            self.model.train()
+            optimizer.zero_grad()
+            loss = criterion(self.model(t_X_tr), t_y_tr)
+            loss.backward()
+            optimizer.step()
+            
+            self.model.eval()
+            with torch.no_grad():
+                val_loss = criterion(self.model(t_X_va), t_y_va).item()
+            
+            scheduler.step(val_loss)
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_weights = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter > 80: # Early stopping patience
+                    break
+                    
+        if best_weights is not None:
+            self.model.load_state_dict({k: v.to(self.device) for k, v in best_weights.items()})
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        self.model.eval()
+        X_s = self.scaler.transform(X.fillna(0))
+        t_X = torch.FloatTensor(X_s).to(self.device)
+        with torch.no_grad():
+            preds = self.model(t_X).cpu().numpy().flatten()
+        return preds
+
+def train_continuous_mlp(
+    train_feats, feature_cols, target_col,
+    X_full, y_full, X_val, y_val, X_test,
+    n_folds=TE_N_FOLDS, seed=SEED, oof_split=None,
+    **kwargs,
+) -> ModelResult:
+    """Trains a continuous surface MLP matching the pipeline's data contract."""
+    X_full_df = _as_feature_df(X_full, feature_cols)
+    X_val_df = _as_feature_df(X_val, feature_cols)
+    X_test_df = _as_feature_df(X_test, feature_cols)
+    y_arr = np.asarray(y_full, dtype=float)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("=" * 60)
+    print(f"MODEL: Continuous MLP Surface Fit on Device: {device}")
+    print("=" * 60)
+    
+    t0 = time.perf_counter()
+    n = len(X_full_df)
+    res = ModelResult(
+        name="ContinuousMLP",
+        oof=np.zeros(n, dtype=float),
+        test_preds=np.zeros(len(X_test_df), dtype=float),
+    )
+    
+    folds = list(oof_split) if oof_split is not None else _kfold_positions(n, n_folds, seed)
+    
+    for fold_i, (tr_pos, va_pos) in enumerate(folds):
+        tr_pos, va_pos = np.asarray(tr_pos, dtype=int), np.asarray(va_pos, dtype=int)
+        if va_pos.size == 0: continue
+        
+        wrapper = MLPWrapper(len(feature_cols), seed, device)
+        wrapper.fit(X_full_df.iloc[tr_pos], y_arr[tr_pos], X_val_df, y_val)
+        
+        res.oof[va_pos] = wrapper.predict(X_full_df.iloc[va_pos])
+        res.fold_rmses.append(rmse(y_arr[va_pos], res.oof[va_pos]))
+        res.best_iters.append(0)
+        
+    print(f"\n  MLP OOF mean RMSE: {np.mean(res.fold_rmses):.5f}")
+    
+    final_wrapper = MLPWrapper(len(feature_cols), seed, device)
+    final_wrapper.fit(X_full_df, y_arr, X_val_df, y_val)
+    res.final_model = final_wrapper
+    res.test_preds = np.asarray(final_wrapper.predict(X_test_df), dtype=float)
+    res.elapsed = time.perf_counter() - t0
+    return res
